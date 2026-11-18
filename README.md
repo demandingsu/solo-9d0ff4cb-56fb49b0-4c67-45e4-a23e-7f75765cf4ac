@@ -66,8 +66,47 @@ STA1,1769040001000,2,3,-3 0 4 ...
 | GET  | `/api/windows/{station}/{window_start_ms}` | 窗口详情:缺口区间、当前有效样点与来源轮次 |
 | POST | `/api/publish` | 发布窗口,JSON `{station, window_start_ms}`;样点不足 1000 返回 409 且旧窗不变 |
 | GET  | `/api/picking/{station}/{window_start_ms}` | 拾取接口:仅现役窗可读(含 `samples` 与逐样点 `rounds`);过期窗返回 409,未发布返回 404 |
+| POST | `/api/triggers/run` | 运行一轮多站触发汇总,JSON `{stations?, from_ms, to_ms, threshold}`;`stations` 省略或为空则汇总全部台站 |
+| GET  | `/api/triggers/rounds?limit=` | 轮次历史(新→旧,含参数、状态、概览);默认 20,上限 50 |
+| GET  | `/api/triggers/rounds/current` | 现行轮次完整结果与来源版本快照;无现行结果返回 404 |
+| GET  | `/api/triggers/rounds/{id}` | 指定轮次详情;失效(superseded/invalid)轮仍可追溯查看 |
 
 `from_ms`/`to_ms` 与 CSV 起点一样支持 epoch 毫秒或 ISO-8601。
+
+## 多站触发汇总
+
+值班员不再逐站翻看,而是按台站与 UTC 时段跑一轮汇总:
+
+- **来源**:只读已发布且 `active` 的整 10 秒窗。范围内未发布(`missing`)
+  或已过期(`stale`)的窗一律列为**未知窗**,不产生触发、不能当作无事件;
+  未知窗还会切断跨窗连续性。
+- **触发**:`|振幅| >= threshold` 的连续越线段的**起点**。越线可跨相邻
+  10 秒窗延续,同一段只记一个起点,来源窗列出跨过的各窗及其发布版本。
+- **归并**:触发按时刻排序切簇,候选内首尾触发时刻相差 **≤ 2000 ms** 且
+  至少来自 **2 个台站**;每个触发只归入一个候选;超出 2 秒不串联,单站簇
+  丢弃(`dropped_single_station_groups` 计数)。
+- **结果**:每个候选给出事件时间、参与台站、各站触发时刻(及越线末点)、
+  来源窗与版本;另列未知窗清单与统计。
+- **留存与替换**:每轮落库;新一轮成功提交才替换现行轮(旧轮标
+  `superseded`)。补传使现役窗过期、重新发布(版本变化)或来源窗从缺失
+  变为已发布时,现行轮在本事务内标 `invalid`(旧轮仍可查看,但不再作为
+  现行结果);重算成功才恢复现行。
+- **一致性**:轮次的读取、计算、落库在同一 `BEGIN IMMEDIATE` 事务内完成,
+  与上传/发布交错时,结果和来源版本快照来自同一已提交状态。
+
+### curl 示例
+
+```bash
+curl -s -X POST -H 'Content-Type: application/json' \
+  -d '{"stations":["STA1","STA2"],"from_ms":"2026-11-17T00:00:00Z",
+       "to_ms":"2026-11-17T00:10:00Z","threshold":40}' \
+  http://localhost:8000/api/triggers/run
+curl -s http://localhost:8000/api/triggers/rounds/current
+curl -s http://localhost:8000/api/triggers/rounds
+```
+
+单轮限额:时段 ≤ 720 个整 10 秒窗(2 小时)、台站 ≤ 100、台站×窗口 ≤ 20000
+(超限返回 400,且不改变现行结果)。
 
 ## curl 示例
 
@@ -95,9 +134,13 @@ curl -s http://localhost:8000/api/picking/STA1/1700000000000
 ```
 app/
   core.py            # 解析、冲突校验、有效样点合成、上传/发布事务
+  triggers.py        # 多站触发提取、2 秒跨站归并、轮次留存/失效
   db.py              # SQLite 单连接 + 锁,建表
   main.py            # FastAPI 路由与网页挂载
-  static/index.html  # 操作网页(上传/缺口浏览/发布/拾取视图)
-tests/test_waveform.py  # 21 条自测:重叠、补传、幂等、原子性、交错一致性
+  static/index.html  # 操作网页(上传/缺口浏览/发布/拾取视图/触发汇总)
+tests/test_waveform.py   # 21 条自测:重叠、补传、幂等、原子性、交错一致性
+tests/test_triggers.py   # 18 条自测:门槛/起点、跨窗(含范围边界)、未知窗、
+                         #   2 秒归并、去重、换版/缺窗转现役失效、失败不替换、
+                         #   交错一致性
 Dockerfile  docker-compose.yml  requirements*.txt
 ```

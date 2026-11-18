@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
-from . import core
+from . import core, triggers
 from .db import Database
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
@@ -16,6 +16,13 @@ STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 class PublishRequest(BaseModel):
     station: str
     window_start_ms: int
+
+
+class TriggerRunRequest(BaseModel):
+    stations: list[str] | None = None
+    from_ms: str | int
+    to_ms: str | int
+    threshold: int
 
 
 def create_app(db_path: str) -> FastAPI:
@@ -36,6 +43,10 @@ def create_app(db_path: str) -> FastAPI:
     @app.exception_handler(core.WindowConflict)
     async def _conflict(_request: Request, exc: core.WindowConflict):
         return JSONResponse({"detail": f"内部一致性错误: {exc}"}, status_code=500)
+
+    @app.exception_handler(triggers.TriggerRejected)
+    async def _trigger_rejected(_request: Request, exc: triggers.TriggerRejected):
+        return JSONResponse({"detail": str(exc)}, status_code=400)
 
     @app.get("/", include_in_schema=False)
     def index():
@@ -90,6 +101,39 @@ def create_app(db_path: str) -> FastAPI:
             raise HTTPException(404, "窗口不存在或尚未发布")
         if res == "stale":
             raise HTTPException(409, "窗口已过期(补传改变了有效样点),需重新发布")
+        return res
+
+    # ------------------------------------------------ 多站触发汇总
+    @app.post("/api/triggers/run")
+    def run_triggers(req: TriggerRunRequest):
+        """按台站与时段运行一轮多站触发汇总;成功后才替换现行结果。"""
+        try:
+            from_ms = core.parse_time_ms(req.from_ms)
+            to_ms = core.parse_time_ms(req.to_ms)
+        except core.BatchRejected as e:
+            raise triggers.TriggerRejected(str(e)) from e
+        return triggers.run_trigger_round(
+            db, req.stations, from_ms, to_ms, req.threshold)
+
+    @app.get("/api/triggers/rounds")
+    def trigger_rounds(limit: int = 20):
+        """轮次历史(新→旧),用于追溯每轮参数、状态与概览。"""
+        return {"rounds": triggers.list_rounds(db, limit)}
+
+    @app.get("/api/triggers/rounds/current")
+    def trigger_current():
+        """现行轮次;无现行结果(未运行或来源已失效)时返回 404。"""
+        res = triggers.current_round(db)
+        if res is None:
+            raise HTTPException(404, "当前没有现行触发汇总结果")
+        return res
+
+    @app.get("/api/triggers/rounds/{round_id}")
+    def trigger_round(round_id: int):
+        """查看历史轮次详情;失效轮仍可追溯,但不能当作现行结果。"""
+        res = triggers.get_round(db, round_id)
+        if res is None:
+            raise HTTPException(404, "轮次不存在")
         return res
 
     return app

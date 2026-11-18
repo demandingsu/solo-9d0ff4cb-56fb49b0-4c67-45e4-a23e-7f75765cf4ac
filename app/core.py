@@ -276,6 +276,11 @@ def upload_csv(db, text: str) -> dict:
                      _dumps(s.samples), s.content_hash(), now))
 
             stale = _mark_stale_windows(conn, to_insert)
+            if stale:
+                from . import triggers  # 避免循环导入
+                triggers.invalidate_on_change(conn, {
+                    (item["station"], item["window_start_ms"])
+                    for item in stale})
             conn.commit()
             return {
                 "inserted": len(to_insert),
@@ -343,6 +348,9 @@ def publish(db, station: str, window_start_ms: int) -> dict:
                 "version=excluded.version, published_at=excluded.published_at",
                 (station, window_start_ms, "active", _dumps(values),
                  _dumps(rounds), version, now))
+            from . import triggers  # 避免循环导入
+            triggers.invalidate_on_change(
+                conn, {(station, window_start_ms)})
             conn.commit()
             return {"station": station, "window_start_ms": window_start_ms,
                     "start_utc": ms_to_iso(window_start_ms), "state": "active",

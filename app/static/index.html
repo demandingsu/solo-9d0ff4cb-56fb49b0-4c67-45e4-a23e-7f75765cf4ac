@@ -34,6 +34,15 @@
   .b-active { background: var(--green); }
   .b-stale  { background: var(--orange); }
   .b-none   { background: var(--gray); }
+  .b-current { background: var(--green); }
+  .b-invalid { background: var(--red); }
+  .b-superseded { background: var(--gray); }
+  .chip { display:inline-block; background:#eaeef2; border-radius:10px;
+          padding:1px 8px; margin:1px 4px 1px 0; font-size:12px; }
+  .checks { display:flex; flex-wrap:wrap; gap:4px 14px; margin:4px 0; }
+  .checks label { font-size:13px; }
+  details summary { cursor:pointer; font-size:13px; color:var(--gray);
+                    margin-top:6px; }
   .ok  { color: var(--green); } .err { color: var(--red); }
   .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
          margin-bottom: 8px; }
@@ -84,6 +93,43 @@
   <pre id="detail">点击上表"详情"或"拾取读取"查看。</pre>
 </section>
 
+<section>
+  <h2>4. 多站触发汇总</h2>
+  <div class="row">
+    <label>从(UTC) <input type="datetime-local" id="trig-from" step="10"></label>
+    <label>到(UTC) <input type="datetime-local" id="trig-to" step="10"></label>
+    <label>振幅门槛 ≥ <input type="number" id="trig-threshold" value="40"
+           min="0" step="1" style="width:90px"></label>
+    <button id="btn-trigger-run">运行一轮</button>
+    <span id="trigger-msg" class="muted"></span>
+  </div>
+  <div class="row">
+    <span class="muted">台站(不选则汇总全部台站):</span>
+    <div id="trig-stations" class="checks"></div>
+    <button id="btn-trigger-refresh" class="ghost">刷新历史</button>
+  </div>
+  <div class="muted" style="margin-bottom:8px">
+    仅从已发布的现役整 10 秒窗提取连续越线起点;越线可跨窗延续,遇到未发布/
+    已过期窗即中断并记为未知(不等于无事件)。至少两站触发时刻首尾相差
+    ≤ 2 秒才形成候选,每个触发只归入一个候选。
+  </div>
+
+  <h2 style="margin-top:14px">现行结果 <span id="current-state" class="muted"></span></h2>
+  <div id="current-body" class="muted">尚未运行,或现行结果已因来源失效而撤回。</div>
+
+  <h2 style="margin-top:14px">本轮轮次历史</h2>
+  <table>
+    <thead><tr>
+      <th>轮次</th><th>运行时刻 (UTC)</th><th>时段 (UTC)</th>
+      <th>门槛</th><th>台站</th><th>候选</th><th>状态</th><th></th>
+    </tr></thead>
+    <tbody id="rounds-body">
+      <tr><td colspan="8" class="muted">尚未运行</td></tr>
+    </tbody>
+  </table>
+  <pre id="round-detail" style="display:none"></pre>
+</section>
+
 </main>
 <script>
 const $ = id => document.getElementById(id);
@@ -131,6 +177,9 @@ $('btn-upload').addEventListener('click', async () => {
     msg.className = 'ok';
     await refreshStations();
     await loadWindows();
+    await loadTriggerStations();
+    await loadCurrent();   // 补传可能使现行触发汇总失效
+    await loadRounds();
   } else {
     msg.textContent = `整批拒收(${status}):${body && body.detail ? body.detail : ''}`;
     msg.className = 'err';
@@ -202,6 +251,8 @@ async function publishWindow(st, wstart) {
   });
   showJson($('detail'), { 操作: '发布', HTTP状态: status, 结果: body });
   await loadWindows();
+  await loadCurrent();   // 换版可能使现行触发汇总失效
+  await loadRounds();
 }
 
 async function showDetail(st, wstart) {
@@ -214,15 +265,188 @@ async function showPicking(st, wstart) {
   showJson($('detail'), { 操作: '拾取接口读取', HTTP状态: status, 结果: summarize(body || {}) });
 }
 
-$('btn-load').addEventListener('click', loadWindows);
+$('btn-load').addEventListener('click', async () => {
+  await loadWindows();
+  await loadTriggerStations();
+});
 
 // ---------- 初始化 ----------
 (function init() {
   const now = Date.now();
   $('from').value = msToInput(now - 30 * 60 * 1000);
   $('to').value = msToInput(now + 30 * 60 * 1000);
-  refreshStations().then(loadWindows);
+  $('trig-from').value = msToInput(now - 5 * 60 * 1000);
+  $('trig-to').value = msToInput(now);
+  refreshStations().then(() => { loadWindows(); loadTriggerStations(); });
+  loadRounds();
 })();
+
+// ---------- 多站触发汇总 ----------
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function isoUtc(ms) {
+  const d = new Date(ms);
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth()+1)}-${pad(d.getUTCDate())} `
+    + `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`
+    + `.${String(d.getUTCMilliseconds()).padStart(3,'0')}Z`;
+}
+const ROUND_STATUS = {
+  current: '<span class="badge b-current">现行</span>',
+  invalid: '<span class="badge b-invalid">来源失效</span>',
+  superseded: '<span class="badge b-superseded">已被新轮替换</span>',
+};
+
+async function loadTriggerStations() {
+  const { body } = await api('/api/stations');
+  const box = $('trig-stations');
+  const checked = new Set([...box.querySelectorAll('input:checked')].map(i => i.value));
+  box.innerHTML = '';
+  for (const s of (body.stations || [])) {
+    const l = document.createElement('label');
+    const i = document.createElement('input');
+    i.type = 'checkbox'; i.value = s; i.checked = checked.has(s);
+    l.appendChild(i); l.appendChild(document.createTextNode(' ' + s));
+    box.appendChild(l);
+  }
+  if (!(body.stations || []).length)
+    box.innerHTML = '<span class="muted">暂无台站</span>';
+}
+
+function renderRoundDetail(d, el) {
+  el.style.display = 'block';
+  el.textContent = JSON.stringify(d, null, 2);
+}
+
+function renderCurrent(d) {
+  const box = $('current-body');
+  const rs = d.result;
+  $('current-state').textContent =
+    `轮次 #${d.id} · 运行于 ${d.created_at} · 门槛 ≥ ${d.threshold}` +
+    ` · 时段 ${d.from_utc} ~ ${d.to_utc}`;
+  if (!rs.candidates.length) {
+    box.innerHTML = '<div class="ok">本时段未形成多站候选事件。</div>';
+  } else {
+    let html = '<table><thead><tr><th>#</th><th>事件时间 (UTC)</th>'
+      + '<th>参与台站</th><th>首尾跨度</th><th>各站触发时刻 (UTC)</th>'
+      + '<th>来源窗版本</th></tr></thead><tbody>';
+    for (const c of rs.candidates) {
+      const trig = c.triggers.map(t =>
+        `<div><b>${esc(t.station)}</b> ${isoUtc(t.start_ms)}</div>`).join('');
+      const src = c.triggers.map(t =>
+        `<div><b>${esc(t.station)}</b> ` +
+        t.source_windows.map(w =>
+          `${isoUtc(w.window_start_ms).slice(11, 19)} v${w.version}`).join(' → ')
+        + '</div>').join('');
+      html += `<tr><td>${c.event_no}</td><td>${isoUtc(c.event_time_ms)}</td>`
+        + `<td>${c.stations.map(s => `<span class="chip">${esc(s)}</span>`).join('')}</td>`
+        + `<td>${c.span_ms} ms</td><td>${trig}</td><td>${src}</td></tr>`;
+    }
+    box.innerHTML = html + '</tbody></table>';
+  }
+  if (rs.unknown_windows.length) {
+    const unk = rs.unknown_windows.map(u =>
+      `<div><b>${esc(u.station)}</b> ${isoUtc(u.window_start_ms)} — `
+      + `${u.state === 'stale' ? '已过期(需重新发布)' : '缺窗(未发布)'}</div>`).join('');
+    box.innerHTML += `<div style="margin-top:10px;color:var(--orange)">`
+      + `<b>未知来源窗 ${rs.unknown_windows.length} 个</b>`
+      + `<span class="muted">(不计入触发,也不能当作无事件)</span>${unk}</div>`;
+  }
+  box.innerHTML += `<details><summary>本轮完整结果与来源版本快照</summary>`
+    + `<pre id="current-json"></pre></details>`;
+  $('current-json').textContent = JSON.stringify(d, null, 2);
+}
+
+async function loadCurrent() {
+  const { status, body } = await api('/api/triggers/rounds/current');
+  const box = $('current-body');
+  if (status === 404) {
+    $('current-state').textContent = '';
+    box.className = 'muted';
+    box.innerHTML = '当前没有现行结果(尚未运行,或来源已失效)。'
+      + '历史轮次仍可在下表查看,但不能作为现行结果。';
+    return;
+  }
+  box.className = '';
+  renderCurrent(body);
+}
+
+async function loadRounds() {
+  const { status, body } = await api('/api/triggers/rounds?limit=50');
+  const tbody = $('rounds-body');
+  if (status !== 200) {
+    tbody.innerHTML = `<tr><td colspan="8" class="err">读取失败:${status}</td></tr>`;
+    return;
+  }
+  const rounds = body.rounds || [];
+  if (!rounds.length) {
+    tbody.innerHTML = '<tr><td colspan="8" class="muted">尚未运行</td></tr>';
+    return;
+  }
+  tbody.innerHTML = '';
+  for (const r of rounds) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>#${r.id}</td>
+      <td>${isoUtc(Date.parse(r.created_at))}</td>
+      <td>${r.from_utc} ~ ${r.to_utc}</td>
+      <td>≥ ${r.threshold}</td>
+      <td>${r.stations.map(s => `<span class="chip">${esc(s)}</span>`).join('')}</td>
+      <td>${r.stats && r.stats.candidates != null ? r.stats.candidates : '—'}</td>
+      <td>${ROUND_STATUS[r.status] || r.status}</td>
+      <td></td>`;
+    const btn = document.createElement('button');
+    btn.textContent = '查看'; btn.className = 'ghost';
+    btn.addEventListener('click', async () => {
+      const res = await api(`/api/triggers/rounds/${r.id}`);
+      if (res.status === 200) {
+        renderRoundDetail(res.body, $('round-detail'));
+      } else {
+        $('round-detail').style.display = 'block';
+        $('round-detail').textContent = `读取失败:${res.status}`;
+      }
+    });
+    tr.lastElementChild.appendChild(btn);
+    tbody.appendChild(tr);
+  }
+}
+
+$('btn-trigger-run').addEventListener('click', async () => {
+  const msg = $('trigger-msg');
+  const lo = inputToMs($('trig-from').value);
+  const hi = inputToMs($('trig-to').value);
+  const threshold = parseInt($('trig-threshold').value, 10);
+  if (lo == null || hi == null) {
+    msg.textContent = '请选择 UTC 时段'; msg.className = 'err'; return;
+  }
+  if (!Number.isInteger(threshold) || threshold < 0) {
+    msg.textContent = '振幅门槛须为非负整数'; msg.className = 'err'; return;
+  }
+  const stations = [...$('trig-stations').querySelectorAll('input:checked')]
+    .map(i => i.value);
+  msg.textContent = '运行中...'; msg.className = 'muted';
+  const { status, body } = await api('/api/triggers/run', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ stations, from_ms: lo, to_ms: hi, threshold })
+  });
+  if (status === 200) {
+    msg.textContent = `轮次 #${body.id} 完成:候选 ${body.result.stats.candidates} 条,`
+      + `未知窗 ${body.result.stats.unknown_windows} 个`;
+    msg.className = 'ok';
+    await loadCurrent();
+    await loadRounds();
+  } else {
+    msg.textContent = `运行失败(${status}):${body && body.detail || ''}(现行结果未改变)`;
+    msg.className = 'err';
+  }
+});
+
+$('btn-trigger-refresh').addEventListener('click', async () => {
+  await loadTriggerStations();
+  await loadCurrent();
+  await loadRounds();
+});
 </script>
 </body>
 </html>
